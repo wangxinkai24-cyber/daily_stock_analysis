@@ -115,7 +115,7 @@ jobs:
                    "并附一句『仅供参考，不构成投资建议』。控制在约1200字内，适合 Telegram 阅读，不用复杂表格。")
           user_m = "【用户持仓】\n" + HOLDINGS + "\n\n" + fx + "\n\n【今日个股分析报告】\n" + report
 
-          body = json.dumps({"model": MODEL, "max_tokens": 2000, "system": sys_p,
+          body = json.dumps({"model": MODEL, "max_tokens": 4000, "system": sys_p,
                              "messages": [{"role": "user", "content": user_m}]}).encode("utf-8")
           req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
               "x-api-key": AK, "anthropic-version": "2023-06-01", "content-type": "application/json"})
