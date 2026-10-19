@@ -1,0 +1,139 @@
+name: 持仓行动报告
+
+on:
+  workflow_run:
+    workflows: ["每日股票分析"]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  advise:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate position advice and send to Telegram
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HOLDINGS: ${{ secrets.HOLDINGS }}
+        run: |
+          python - <<'PY'
+          import os, io, json, zipfile, urllib.request, urllib.parse
+
+          REPO = os.environ["GITHUB_REPOSITORY"]
+          GH_TOKEN = os.environ["GH_TOKEN"]
+          AK = os.environ["ANTHROPIC_API_KEY"]
+          MODEL = os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-5-5"
+          TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+          TG_CHAT = os.environ["TELEGRAM_CHAT_ID"]
+          HOLDINGS = os.environ.get("HOLDINGS", "").strip()
+
+          class NoAuthRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  nr = super().redirect_request(req, fp, code, msg, headers, newurl)
+                  if nr is not None:
+                      nr.headers = {k: v for k, v in nr.headers.items() if k.lower() != "authorization"}
+                  return nr
+
+          def gh_json(url):
+              req = urllib.request.Request(url, headers={
+                  "Authorization": "Bearer " + GH_TOKEN,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "position-advice"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.loads(r.read())
+
+          def gh_zip(url):
+              req = urllib.request.Request(url, headers={
+                  "Authorization": "Bearer " + GH_TOKEN,
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "position-advice"})
+              op = urllib.request.build_opener(NoAuthRedirect)
+              with op.open(req, timeout=120) as r:
+                  return r.read()
+
+          run_id = None
+          ep = os.environ.get("GITHUB_EVENT_PATH")
+          if ep and os.path.exists(ep):
+              with open(ep) as f:
+                  ev = json.load(f)
+              run_id = (ev.get("workflow_run") or {}).get("id")
+          if not run_id:
+              try:
+                  runs = gh_json("https://api.github.com/repos/" + REPO + "/actions/workflows/00-daily-analysis.yml/runs?status=success&per_page=1")
+                  items = runs.get("workflow_runs", [])
+                  if items:
+                      run_id = items[0]["id"]
+              except Exception as e:
+                  print("list runs failed:", e)
+
+          report = ""
+          if run_id:
+              try:
+                  arts = gh_json("https://api.github.com/repos/" + REPO + "/actions/runs/" + str(run_id) + "/artifacts")
+                  for a in arts.get("artifacts", []):
+                      try:
+                          zf = zipfile.ZipFile(io.BytesIO(gh_zip(a["archive_download_url"])))
+                          for n in zf.namelist():
+                              ln = n.lower()
+                              if ln.endswith((".md", ".markdown", ".txt")) or ("report" in ln and not ln.endswith(".log")):
+                                  try:
+                                      report += "\n\n===== " + n + " =====\n" + zf.read(n).decode("utf-8", "ignore")
+                                  except Exception:
+                                      pass
+                      except Exception as e:
+                          print("artifact failed:", e)
+              except Exception as e:
+                  print("artifacts list failed:", e)
+
+          report = report.strip()
+          if len(report) > 60000:
+              report = report[:60000] + "\n...(报告过长已截断)"
+          if not report:
+              report = "（未取到当天分析报告原文，请仅基于持仓给出谨慎提示并说明报告缺失。）"
+
+          fx = ""
+          try:
+              d = gh_json("https://api.frankfurter.app/latest?from=USD&to=EUR")
+              rate = d.get("rates", {}).get("EUR")
+              if rate:
+                  fx = "参考汇率 1 USD ≈ " + str(rate) + " EUR。"
+          except Exception:
+              pass
+
+          sys_p = ("你是用户的持仓助理。用户是欧元账户、持有美股。基于下面的【今日个股分析报告】和【用户持仓】，"
+                   "为每只持仓生成简明中文行动建议：标注持股数/均价(€)/大致盈亏方向，结合当天信号给出 "
+                   "减仓/加仓/持有 的建议 + 一句理由 + 一个主要风险。开头一行日期标题，结尾一行总体提示，"
+                   "并附一句『仅供参考，不构成投资建议』。控制在约1200字内，适合 Telegram 阅读，不用复杂表格。")
+          user_m = "【用户持仓】\n" + HOLDINGS + "\n\n" + fx + "\n\n【今日个股分析报告】\n" + report
+
+          body = json.dumps({"model": MODEL, "max_tokens": 2000, "system": sys_p,
+                             "messages": [{"role": "user", "content": user_m}]}).encode("utf-8")
+          req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+              "x-api-key": AK, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+          with urllib.request.urlopen(req, timeout=180) as r:
+              resp = json.loads(r.read())
+          advice = "".join(b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text").strip()
+          if not advice:
+              advice = "（生成失败，请检查运行日志。）"
+
+          def tg_send(text):
+              data = urllib.parse.urlencode({"chat_id": TG_CHAT, "text": text}).encode()
+              req = urllib.request.Request("https://api.telegram.org/bot" + TG_TOKEN + "/sendMessage", data=data)
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return r.read()
+
+          msg = "📊 持仓行动建议\n\n" + advice
+          parts = [msg[i:i+3800] for i in range(0, len(msg), 3800)] or [msg]
+          for p in parts:
+              tg_send(p)
+          print("sent", len(parts), "telegram message(s)")
+          PY
